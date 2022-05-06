@@ -1,8 +1,11 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
-}
+#![cfg_attr(not(test), no_std)]
+
+pub mod block_cache;
+pub mod buffer;
+pub mod dev;
+pub mod dirty;
+pub mod vfs;
+
+#[macro_use]
+extern crate lazy_static;
+extern crate alloc;
