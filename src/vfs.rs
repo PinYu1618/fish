@@ -1,116 +1,176 @@
-use core::any::Any;
+use spin::{Mutex, MutexGuard};
+use crate::{BlockCacher, BlockDevice, DirEntry};
+use super::DiskInode;
+use super::DiskInodeType;
+use super::SnailFileSystem;
+use super::DIRENT_SZ;
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use alloc::sync::Arc;
-
-pub enum FsError {
-    InvalidParam,
+pub struct Inode {
+    block_id: usize,
+    block_offset: usize,
+    fs: Arc<Mutex<SnailFileSystem>>,
+    block_dev: Arc<dyn BlockDevice>,
 }
 
-pub type Result<T> = core::result::Result<T, FsError>;
+impl Inode {
+    // We should not acquire sfs lock here.
+    pub fn new(
+        block_id: u32,
+        block_offset: usize,
+        fs: Arc<Mutex<SnailFileSystem>>,
+        block_dev: Arc<dyn BlockDevice>,
+    ) -> Self {
+        Self {
+            block_id: block_id as usize,
+            block_offset,
+            fs,
+            block_dev,
+        }
+    }
 
-pub trait Inode: Any + Sync + Send {
-    fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize>;
+    pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
+        let fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| {
+            self.find_inode_id(name, disk_inode).map(|inode_id| {
+                let (block_id, block_offset) = fs.disk_inode_pos(inode_id);
+                Arc::new(Self::new(
+                    block_id,
+                    block_offset,
+                    self.fs.clone(),
+                    self.block_dev.clone(),
+                ))
+            })
+        })
+    }
 
-    fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize>;
+    pub fn ls(&self) -> Vec<String> {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| {
+            let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+            let mut v: Vec<String> = Vec::new();
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_dev,),
+                    DIRENT_SZ,
+                );
+                v.push(String::from(dirent.name()));
+            }
+            v
+        })
+    }
 
-    fn metadata(&self) -> Result<Metadata>;
+    pub fn create(&self, name: &str) -> Option<Arc<Inode>> {
+        let mut fs = self.fs.lock();
+        if self.modify_disk_inode(|root_inode| {
+            // assert it is a directory
+            assert!(root_inode.is_dir());
+            // has the file been created?
+            self.find_inode_id(name, root_inode)
+        }).is_some() {
+            return None;
+        }
+        // create a new file
+        // alloc a inode with an indirect block
+        let new_inode_id = fs.alloc_inode();
+        // initialize inode
+        let (new_inode_block_id, new_inode_block_offset) = fs.disk_inode_pos(new_inode_id);
+        BlockCacher::cache_block(new_inode_block_id as usize, Arc::clone(&self.block_dev))
+            .lock()
+            .modify(new_inode_block_offset, |new_inode: &mut DiskInode| {
+                new_inode.init(DiskInodeType::File);
+            });
+        self.modify_disk_inode(|root_inode| {
+            // append file in the dirent
+            let file_count = (root_inode.size as usize) / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            // increase size
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            // write dirent
+            let dirent = DirEntry::new(name, new_inode_id);
+            root_inode.write_at(file_count * DIRENT_SZ, dirent.as_bytes(), &self.block_dev);
+        });
 
-    fn link(&self, name: &str, other: &Arc<dyn Inode>) -> Result<()>;
+        let (block_id, block_offset) = fs.disk_inode_pos(new_inode_id);
+        // return inode
+        Some(Arc::new(Self::new(
+            block_id,
+            block_offset,
+            self.fs.clone(),
+            self.block_dev.clone(),
+        )))
+        // release efs lock automatically by compiler
+    }
 
-    fn unlink(&self, name: &str) -> Result<()>;
+    pub fn clear(&self) {
+        let mut fs = self.fs.lock();
+        self.modify_disk_inode(|disk_inode| {
+            let size = disk_inode.size;
+            let data_blocks_dealloc = disk_inode.clear_size(&self.block_dev);
+            assert!(data_blocks_dealloc.len() == DiskInode::total_blocks(size) as usize);
+            for data_block in data_blocks_dealloc.into_iter() {
+                fs.dealloc_data(data_block);
+            }
+        });
+    }
 
-    fn ioctl(&self, cmd: u32, data: usize) -> Result<usize>;
+    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> usize {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.read_at(offset, buf, &self.block_dev))
+    }
 
-    fn mmap(&self, area: MMapArea) -> Result<()>;
-}
+    pub fn write_at(&self, offset: usize, buf: &[u8]) -> usize {
+        let mut fs = self.fs.lock();
+        self.modify_disk_inode(|disk_inode| {
+            self.increase_size((offset + buf.len()) as u32, disk_inode, &mut fs);
+            disk_inode.write_at(offset, buf, &self.block_dev)
+        })
+    }
 
-pub trait FileSystem: Any + Sync + Send {
-    fn sync(&self) -> Result<()>;
+    fn increase_size(
+        &self,
+        new_size: u32,
+        disk_inode: &mut DiskInode,
+        fs: &mut MutexGuard<SnailFileSystem>,
+    ) {
+        if new_size < disk_inode.size {
+            return;
+        }
+        let blocks_needed = disk_inode.blocks_num_needed(new_size);
+        let mut v: Vec<u32> = Vec::new();
+        for _ in 0..blocks_needed {
+            v.push(fs.alloc_data());
+        }
+        disk_inode.increase_size(new_size, v, &self.block_dev);
+    }
 
-    fn root_inode(&self) -> Arc<dyn Inode>;
+    fn read_disk_inode<V>(&self, f: impl FnOnce(&DiskInode) -> V) -> V {
+        BlockCacher::cache_block(self.block_id, Arc::clone(&self.block_dev))
+            .lock()
+            .read(self.block_offset, f)
+    }
 
-    fn info(&self) -> FsInfo;
-}
+    fn modify_disk_inode<V>(&self, f: impl FnOnce(&mut DiskInode) -> V) -> V {
+        BlockCacher::cache_block(self.block_id, Arc::clone(&self.block_dev))
+            .lock()
+            .modify(self.block_offset, f)
+    }
 
-pub enum FileType {
-    File,
-    Directory,
-    Symlink,
-    NamedPipe,
-    CharDevice,
-    BlockDevice,
-    Socket,
-}
-
-pub struct Timespec {
-    pub sec: i64,
-    pub nsec: i32,
-}
-
-/// Metadata of Inode
-pub struct Metadata {
-    /// Device ID
-    pub dev: usize, // (major << 8) | minor
-    /// Inode number
-    pub inode: usize,
-    /// Size in bytes
-    pub size: usize,
-    pub blk_size: usize,
-    /// Size in blocks
-    pub blocks: usize,
-    /// Time of last access
-    pub atime: Timespec,
-    /// Time of last modification
-    pub mtime: Timespec,
-    /// Time of last change
-    pub ctime: Timespec,
-    /// Type of file
-    pub type_: FileType,
-    /// Permission
-    pub mode: u16,
-    pub nlinks: usize,
-    /// User ID
-    pub uid: usize,
-    /// Group ID
-    pub gid: usize,
-    /// Raw device id
-    /// e.g. /dev/null: makedev(0x1, 0x3)
-    pub rdev: usize, // (major << 8) | minor
-}
-
-/// Metadata of FileSystem
-pub struct FsInfo {
-    /// File system block size
-    pub bsize: usize,
-    /// Fundamental file system block size
-    pub frsize: usize,
-    /// Total number of blocks on file system in units of `frsize`
-    pub blocks: usize,
-    /// Total number of free blocks
-    pub bfree: usize,
-    /// Number of free blocks available to non-privileged process
-    pub bavail: usize,
-    /// Total number of file serial numbers
-    pub files: usize,
-    /// Total number of free file serial numbers
-    pub ffree: usize,
-    /// Maximum filename length
-    pub namemax: usize,
-}
-
-pub struct MMapArea {
-    /// Start virtual address
-    pub start_vaddr: usize,
-    /// End virtual address
-    pub end_vaddr: usize,
-    /// Access permissions
-    pub prot: usize,
-    /// Flags
-    pub flags: usize,
-    /// Offset from the file in bytes
-    pub offset: usize,
-}
-
-pub fn make_rdev(major: usize, minor: usize) -> usize {
-    ((major & 0xfff) << 8) | (minor & 0xff)
+    fn find_inode_id(&self, name: &str, disk_inode: &DiskInode) -> Option<u32> {
+        // assert it is a directory
+        assert!(disk_inode.is_dir());
+        let file_count = (disk_inode.size as usize) / DIRENT_SZ;
+        let mut dirent = DirEntry::empty();
+        for i in 0..file_count {
+            assert_eq!(
+                disk_inode.read_at(DIRENT_SZ * i, dirent.as_bytes_mut(), &self.block_dev,),
+                DIRENT_SZ,
+            );
+            if dirent.name() == name {
+                return Some(dirent.ino() as u32);
+            }
+        }
+        None
+    }
 }
